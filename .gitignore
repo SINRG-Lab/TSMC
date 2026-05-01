@@ -1,12 +1,10 @@
 data/answering/masks
 data/answering/render
-data/answering/meshes
 data/answering/meshes/dynamic
 data/answering/meshes/gt
 data/answering/meshes/static
 data/synthetic/masks
 data/synthetic/render
-data/synthetic/meshes
 data/synthetic/meshes/dynamic
 data/synthetic/meshes/gt
 data/synthetic/meshes/static
