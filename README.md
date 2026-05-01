@@ -16,4 +16,7 @@ Guodong Chen, Libor Váša, Amrita Mazumdar, Mallesham Dasari
 This repository contains the official authors implementation associated with the paper "TSMC: Time-varying 4D Scene Mesh Compression".
 
 
-
+## TODOs
+- [x] SAM3-based dynamic and static mesh differentiation
+- [x] TSMC dynamic compression
+- [ ] VR headset decoder and playback system

@@ -4,6 +4,22 @@ import cv2
 import open3d as o3d
 import numpy as np
 from collections import deque
+from copy import deepcopy
+import trimesh
+import time
+import math
+import matplotlib.pyplot as plt
+from collections import defaultdict
+import cupy as cp
+from scipy.spatial.distance import directed_hausdorff
+from tqdm import tqdm
+from scipy.sparse import coo_matrix, lil_matrix, save_npz, vstack, diags, identity
+import cupyx
+import cupyx.scipy.sparse
+from cupyx.scipy.sparse.linalg import cg
+import point_cloud_utils as pcu
+import matplotlib.cm as cm
+from skimage.metrics import structural_similarity as ssim, peak_signal_noise_ratio as psnr
 
 def flip_uv_v_inplace(mesh: o3d.geometry.TriangleMesh):
     if not mesh.has_triangle_uvs():
@@ -1074,3 +1090,400 @@ def remove_small_dynamic_components(face_is_dynamic, neighbors, min_component_fa
             refined[comp] = False
 
     return refined
+
+def subdivide_surface_fitting(decimated_mesh, target_mesh, iterations=1):
+    subdivided_mesh = o3d.geometry.TriangleMesh.subdivide_midpoint(decimated_mesh, number_of_iterations=iterations)
+    #print(subdivided_mesh)
+    subdivided_mesh.compute_vertex_normals()
+
+    pcd_target = o3d.geometry.PointCloud()
+    pcd_target.points = o3d.utility.Vector3dVector(target_mesh.vertices)
+    pcd_tree = o3d.geometry.KDTreeFlann(pcd_target)
+    subdivided_vertices = np.array(subdivided_mesh.vertices)
+    target_vertices = np.array(target_mesh.vertices)
+    fitting_vertices = deepcopy(subdivided_vertices)
+
+    for i in range(0, len(subdivided_vertices)):
+        [k, index, _] = pcd_tree.search_knn_vector_3d(subdivided_vertices[i], 1)
+        fitting_vertices[i] = target_vertices[np.asarray(index)]
+
+    subdivided_mesh.vertices = o3d.utility.Vector3dVector(fitting_vertices)
+    return subdivided_mesh
+
+def read_triangle_mesh_with_trimesh(avatar_name, enable_post_processing=False):
+    if enable_post_processing:
+        scene_patch = trimesh.load(avatar_name, process=True)
+    else:
+        scene_patch = trimesh.load(avatar_name, process=False, maintain_order=True)
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(scene_patch.vertices),
+        o3d.utility.Vector3iVector(scene_patch.faces)
+    )
+    if scene_patch.vertex_normals.size:
+        mesh.vertex_normals = o3d.utility.Vector3dVector(scene_patch.vertex_normals.copy())
+    if scene_patch.visual.defined:
+        if scene_patch.visual.kind == 'vertex':
+            mesh.vertex_colors = o3d.utility.Vector3dVector(
+                scene_patch.visual.vertex_colors[:, :3] / 255)
+        elif scene_patch.visual.kind == 'texture':
+            uv = scene_patch.visual.uv
+            if uv.shape[0] == scene_patch.vertices.shape[0]:
+                mesh.triangle_uvs = o3d.utility.Vector2dVector(uv[scene_patch.faces.flatten()])
+            elif uv.shape[0] != scene_patch.faces.shape[0] * 3:
+                assert False
+            else:
+                mesh.triangle_uvs = o3d.utility.Vector2dVector(uv)
+                if scene_patch.visual.material is not None and scene_patch.visual.material.image is not None:
+                    if scene_patch.visual.material.image.mode == 'RGB':
+                        mesh.textures = [o3d.geometry.Image(np.asarray(scene_patch.visual.material.image))]
+                    else:
+                        assert False
+        else:
+            assert False
+    return mesh
+
+def solve_sparse_least_squares_cg(L_star_gpu, D_hat_gpu, maxiter=500, tol=1e-6):
+    A_T = L_star_gpu.transpose()
+    AtA = A_T @ L_star_gpu
+    AtB = A_T @ D_hat_gpu
+
+    num_cols = AtB.shape[1]
+    n = AtA.shape[0]
+    S_recon_gpu = cp.zeros((n, num_cols), dtype=cp.float32)
+
+    for i in range(num_cols):
+        b = AtB[:, i]
+        x, info = cg(AtA, b, tol=tol, maxiter=maxiter)
+        if info != 0:
+            print(f"CG did not converge on column {i}, info: {info}")
+        S_recon_gpu[:, i] = x
+
+    return S_recon_gpu
+
+def build_mv_laplacian_gpu_fast(mesh, anchor_indices=[]):
+    vertices = np.asarray(mesh.vertices)
+    adjacency_list = mesh.adjacency_list
+    n = len(vertices)
+
+    start = time.time()
+    W = compute_mv_weights_gpu(vertices, adjacency_list)
+    print("Computing mv weights:", time.time() - start)
+
+    start_time = time.time()
+
+    # Normalize W by row sums (L = I - D⁻¹W)
+    W = W.tocsr()
+    row_sums = np.array(W.sum(axis=1)).flatten()
+    row_inv = np.reciprocal(row_sums, where=row_sums > 1e-8)
+
+    D_inv = diags(row_inv)
+    L = identity(n, format='csr') - D_inv @ W
+    print("Laplacian build time (vectorized):", time.time() - start_time)
+
+    start = time.time()
+    if len(anchor_indices) > 0:
+        anchor_rows = lil_matrix((len(anchor_indices), n))
+        for row_offset, ki in enumerate(anchor_indices):
+            anchor_rows[row_offset, ki] = 1
+        L_ext = vstack([L, anchor_rows]).tocsr()
+    else:
+        L_ext = L
+    print("vstack method:", time.time() - start)
+    return L_ext
+
+
+
+def compute_delta_trajectories(L_ext, S):
+    """
+    Compute delta trajectory matrix D = L* @ S
+    L_ext: (n+l) x n sparse matrix
+    S: n x m matrix
+    """
+    return L_ext @ S  # Result is (n+l) x m
+
+def compute_mv_weights_gpu(vertices, adjacency_list):
+    n = len(vertices)
+    row, col = [], []
+
+    for i in range(n):
+        neighbors = adjacency_list[i]
+        row.extend([i] * len(neighbors))
+        col.extend(neighbors)
+
+    row = np.array(row, dtype=np.int32)
+    col = np.array(col, dtype=np.int32)
+
+    vertices_gpu = cp.asarray(vertices)
+    vi_gpu = vertices_gpu[row]
+    vj_gpu = vertices_gpu[col]
+
+    diff_gpu = vj_gpu - vi_gpu
+    dist_gpu = cp.linalg.norm(diff_gpu, axis=1) + 1e-8
+    weights_gpu = 1.0 / dist_gpu
+
+    # Transfer to CPU just once
+    data = cp.asnumpy(weights_gpu)
+
+    W = coo_matrix((data, (row, col)), shape=(n, n)).tocsr()
+    return W
+
+def compute_D1_psnr(original_mesh, decoded_mesh):
+    original_vertices = np.array(original_mesh.vertices)
+    decoded_vertices = np.array(decoded_mesh.vertices)
+
+    pcd_original = o3d.geometry.PointCloud()
+    pcd_original.points = o3d.utility.Vector3dVector(original_vertices)
+
+    pcd_decoded = o3d.geometry.PointCloud()
+    pcd_decoded.points = o3d.utility.Vector3dVector(decoded_vertices)
+    pcd_tree = o3d.geometry.KDTreeFlann(pcd_decoded)
+
+    MSE = 0
+    for i in range(0, len(original_vertices)):
+        [k, index, _] = pcd_tree.search_knn_vector_3d(original_vertices[i], 1)
+        MSE += np.square(np.linalg.norm(original_vertices[i] - decoded_vertices[index]))
+    MSE = MSE / len(original_vertices)
+    aabb = pcd_original.get_axis_aligned_bounding_box()
+    min_bound = aabb.get_min_bound()
+
+    max_bound = aabb.get_max_bound()
+
+    signal_peak = np.linalg.norm(max_bound - min_bound)
+    psnr = 20 * np.log10(signal_peak) - 10 * np.log10(MSE)
+    return psnr
+
+def compute_MSE_RMSE(original_mesh, decoded_mesh):
+    original_vertices = np.array(original_mesh.vertices)
+
+    decoded_vertices = np.array(decoded_mesh.vertices)
+
+    pcd_original = o3d.geometry.PointCloud()
+    pcd_original.points = o3d.utility.Vector3dVector(original_vertices)
+
+    pcd_decoded = o3d.geometry.PointCloud()
+    pcd_decoded.points = o3d.utility.Vector3dVector(decoded_vertices)
+    pcd_tree = o3d.geometry.KDTreeFlann(pcd_decoded)
+
+    MSE = 0
+    for i in range(0, len(original_vertices)):
+        [k, index, _] = pcd_tree.search_knn_vector_3d(original_vertices[i], 1)
+        MSE += np.square(np.linalg.norm(original_vertices[i] - decoded_vertices[index]))
+    MSE = MSE / len(original_vertices)
+    RMSE = np.sqrt(MSE)
+
+    return np.log10(MSE), np.log10(RMSE)
+
+def calculate_bitrate(file_size, duration):
+    return file_size * 8 / duration
+
+def compute_D2_psnr_test(original_mesh, decoded_mesh, show_plot=True):
+    # Extract vertices and triangles for signed distance computation
+    original_vertices = np.asarray(original_mesh.vertices)
+    decoded_vertices = np.asarray(decoded_mesh.vertices)
+    decoded_faces = np.asarray(decoded_mesh.triangles)
+
+    # Compute signed distances from original vertices to decoded mesh surface
+    sdf, _, _ = pcu.signed_distance_to_mesh(original_vertices, decoded_vertices, decoded_faces)
+
+    # Use absolute distance as unsigned distance
+    dists = np.abs(sdf)
+
+    MSE = np.mean(dists ** 2)
+
+    min_bound, max_bound = original_mesh.get_min_bound(), original_mesh.get_max_bound()
+    signal_peak = np.linalg.norm(max_bound - min_bound)
+
+    psnr = 20 * np.log10(signal_peak) - 10 * np.log10(MSE)
+
+    # Colorize original mesh with per-vertex errors
+    colors = plt.get_cmap("jet")((dists - dists.min()) / (dists.ptp() + 1e-8))[:, :3]
+    colored_mesh = o3d.geometry.TriangleMesh()
+    colored_mesh.vertices = o3d.utility.Vector3dVector(original_vertices)
+    colored_mesh.triangles = original_mesh.triangles
+    colored_mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
+
+    # Show the mesh and error histogram if requested
+    if show_plot:
+        o3d.visualization.draw_geometries([colored_mesh], window_name="Per-vertex Error")
+
+        plt.figure(figsize=(6, 4))
+        plt.hist(dists, bins=50, color='blue', edgecolor='black')
+        plt.title("Per-vertex Distance Histogram")
+        plt.xlabel("Distance (error)")
+        plt.ylabel("Count")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+    return psnr
+
+def render_mesh(mesh, width=512, height=512, camera_params=None):
+    """
+    Headless mesh rendering compatible with Open3D 0.19.0.
+    Produces a normal (RGB) and a depth image.
+
+    Args:
+        mesh (o3d.geometry.TriangleMesh): Input mesh.
+        width (int): Render width.
+        height (int): Render height.
+        camera_params (o3d.camera.PinholeCameraParameters): Optional camera parameters.
+
+    Returns:
+        tuple: (normal_img, depth_img, depth_range)
+    """
+    # Copy mesh to avoid modifying the input
+    mesh_copy = o3d.geometry.TriangleMesh(mesh)
+    if not mesh_copy.has_vertex_normals():
+        mesh_copy.compute_vertex_normals()
+
+    # Convert normals to RGB colors in [0,1]
+    normals = np.asarray(mesh_copy.vertex_normals)
+    mesh_copy.vertex_colors = o3d.utility.Vector3dVector((normals + 1.0) / 2.0)
+
+    # Create offscreen renderer
+    renderer = o3d.visualization.rendering.OffscreenRenderer(width, height)
+
+    # Unlit material → render vertex colors directly
+    mat = o3d.visualization.rendering.MaterialRecord()
+    mat.shader = "defaultUnlit"
+    renderer.scene.add_geometry("mesh", mesh_copy, mat)
+
+    # Camera setup
+    if camera_params is not None:
+        intrinsic = camera_params.intrinsic.intrinsic_matrix
+        extrinsic = camera_params.extrinsic
+        renderer.setup_camera(intrinsic, extrinsic, width, height)
+    else:
+        center = mesh_copy.get_center()
+        eye = center + np.array([0, 0, 2.0])
+        up = [0, 1, 0]
+        renderer.scene.camera.look_at(center, eye, up)
+
+    # ---- Rendering ----
+    normal_img = np.asarray(renderer.render_to_image(), dtype=np.uint8)
+
+    depth_f = np.asarray(renderer.render_to_depth_image())
+    dmin, dmax = float(depth_f.min()), float(depth_f.max())
+    if dmax > dmin:
+        depth_img = ((depth_f - dmin) / (dmax - dmin) * 255).astype(np.uint8)
+    else:
+        depth_img = np.zeros_like(depth_f, dtype=np.uint8)
+
+    # Clean up (no .release() in 0.19)
+    renderer.scene.clear_geometry()
+    del renderer
+
+    return normal_img, depth_img, (dmin, dmax)
+
+def compute_ssim(img1, img2, multichannel=False):
+    """
+    Compute SSIM between two images.
+
+    Args:
+        img1 (np.ndarray): First image.
+        img2 (np.ndarray): Second image.
+        multichannel (bool): True for RGB images, False for grayscale.
+
+    Returns:
+        float: SSIM score.
+    """
+    if multichannel:
+        score = ssim(img1, img2, channel_axis=2, data_range=255)
+    else:
+        score = ssim(img1, img2, data_range=255)
+    return score
+
+def compute_psnr(img1, img2):
+    """
+    Compute PSNR between two images.
+
+    Args:
+        img1 (np.ndarray): First image.
+        img2 (np.ndarray): Second image.
+
+    Returns:
+        float: PSNR score.
+    """
+    mse = np.mean((img1.astype(float) - img2.astype(float)) ** 2)
+    if mse == 0:
+        return float('inf')
+    max_pixel = 255.0
+    psnr = 20 * np.log10(max_pixel / np.sqrt(mse))
+    return psnr
+
+def evaluate_meshes(gt_mesh, recon_mesh, viewpoints, output_dir="renderings", width=1080, height=1920):
+    """
+    Evaluate two meshes by rendering normal maps and depth images from multiple viewpoints
+    and computing SSIM and PSNR scores.
+
+    Args:
+        gt_mesh (o3d.geometry.TriangleMesh): Ground truth mesh.
+        recon_mesh (o3d.geometry.TriangleMesh): Reconstructed mesh.
+        viewpoints (list): List of PinholeCameraParameters.
+        output_dir (str): Directory to save rendered images.
+
+    Returns:
+        tuple: (avg_ssim_depth, avg_ssim_normal) - Average SSIM for depth and normal map images.
+    """
+    # Ensure meshes have vertex normals
+    if not gt_mesh.has_vertex_normals():
+        gt_mesh.compute_vertex_normals()
+    if not recon_mesh.has_vertex_normals():
+        recon_mesh.compute_vertex_normals()
+
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+
+    ssim_scores_depth = []
+    ssim_scores_normal = []
+    psnr_scores_depth = []
+    psnr_scores_normal = []
+
+    # Render and compare for each viewpoint
+    for i, view in enumerate(viewpoints):
+        # Render both meshes (normal map and depth)
+        gt_normal, gt_depth, gt_depth_range = render_mesh(gt_mesh, width=width, height=height, camera_params=view)
+        recon_normal, recon_depth, recon_depth_range = render_mesh(recon_mesh, width=width, height=height, camera_params=view)
+
+        # Debug: Print image shapes and ranges
+        #print(f"View {i+1} - GT Normal Shape: {gt_normal.shape}, GT Depth Shape: {gt_depth.shape}, GT Depth Range: {gt_depth_range}")
+        #print(f"View {i+1} - Recon Normal Shape: {recon_normal.shape}, Recon Depth Shape: {recon_depth.shape}, Recon Depth Range: {recon_depth_range}")
+        #print(f"View {i+1} - GT Normal Mean (R,G,B): {np.mean(gt_normal, axis=(0,1))}")
+        #print(f"View {i+1} - Recon Normal Mean (R,G,B): {np.mean(recon_normal, axis=(0,1))}")
+
+        # Save renderings
+        cv2.imwrite(os.path.join(output_dir, f"gt_view_{i}_normal.png"), cv2.cvtColor(gt_normal, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(os.path.join(output_dir, f"recon_view_{i}_normal.png"), cv2.cvtColor(recon_normal, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(os.path.join(output_dir, f"gt_view_{i}_depth.png"), gt_depth)
+        cv2.imwrite(os.path.join(output_dir, f"recon_view_{i}_depth.png"), recon_depth)
+
+        # Save debug difference image (normal map)
+        normal_diff = np.abs(gt_normal.astype(float) - recon_normal.astype(float))
+        normal_diff = (normal_diff / normal_diff.max() * 255).astype(np.uint8) if normal_diff.max() > 0 else normal_diff.astype(np.uint8)
+        cv2.imwrite(os.path.join(output_dir, f"view_{i}_normal_diff.png"), cv2.cvtColor(normal_diff, cv2.COLOR_RGB2BGR))
+
+        # Compute SSIM for depth and normal maps
+        score_depth = compute_ssim(gt_depth, recon_depth, multichannel=False)
+        score_normal = compute_ssim(gt_normal, recon_normal, multichannel=True)
+        ssim_scores_depth.append(score_depth)
+        ssim_scores_normal.append(score_normal)
+        #print(f"View {i+1} - Depth SSIM: {score_depth:.4f}, Normal SSIM: {score_normal:.4f}")
+
+        # Compute PSNR for completeness
+        psnr_depth = compute_psnr(gt_depth, recon_depth)
+        psnr_normal = compute_psnr(gt_normal, recon_normal)
+        psnr_scores_depth.append(psnr_depth)
+        psnr_scores_normal.append(psnr_normal)
+        #print(f"View {i+1} - Depth PSNR: {psnr_depth:.4f}, Normal PSNR: {psnr_normal:.4f}")
+
+    # Compute average SSIM
+    avg_ssim_depth = np.mean(ssim_scores_depth) if ssim_scores_depth else 0
+    avg_ssim_normal = np.mean(ssim_scores_normal) if ssim_scores_normal else 0
+    #print(f"Average Depth SSIM: {avg_ssim_depth:.4f}")
+    #print(f"Average Normal SSIM: {avg_ssim_normal:.4f}")
+
+    avg_psnr_depth = np.mean(psnr_scores_depth) if psnr_scores_depth else 0
+    avg_psnr_normal = np.mean(psnr_scores_normal) if psnr_scores_normal else 0
+    # print(f"Average Depth PSNR: {avg_psnr_depth:.4f}")
+    # print(f"Average Normal PSNR: {avg_psnr_normal:.4f}")
+
+    return avg_ssim_depth, avg_ssim_normal, avg_psnr_depth, avg_psnr_normal
