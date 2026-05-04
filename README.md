@@ -19,7 +19,7 @@ This repository contains the official authors implementation associated with the
 ## TODOs
 - [x] SAM3-based dynamic and static mesh differentiation
 - [x] TSMC dynamic compression
-- [ ] VR headset decoder and playback system
+- [ ] VR headset decoder and playback system (check out [this](https://github.com/SINRG-Lab/4D_Mesh_Decoder_UnityPlugin), will integrate it soon)
 
 
 ## BibTex
