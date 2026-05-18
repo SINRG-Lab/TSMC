@@ -28,7 +28,7 @@ This repository contains the official authors implementation associated with the
   title={TSMC: Time-varying 4D Scene Mesh Compression},
   author={Chen, Guodong and Váša, Libor and Mazumdar, Amrita and Dasari, Mallesham},
   booktitle={Proceedings of the Special Interest Group on Computer Graphics and Interactive Techniques Conference Conference Papers},
-  pages={1--11},
+  pages={1--12},
   year={2026}
 }
 ```
@@ -61,7 +61,7 @@ Our default environment is based on Conda package and environment management:
 conda env create --file environment.yml
 conda activate tsmc
 ```
-Install .NET 7.0 or 5.0 for Ubuntu 24.04:
+Install .NET 7.0 and 5.0 for Ubuntu 24.04:
 ```aiignore
 wget https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
 ./dotnet-install.sh --version 7.0.202 

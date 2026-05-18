@@ -7,7 +7,7 @@ DATASET="..."
 NUM_FRAMES=10
 NUM_CENTERS=2000
 
-for GROUP_IDX in {1..1}; do
+for GROUP_IDX in {1..10}; do
     echo "======================"
     echo " Running group $GROUP_IDX"
     echo "======================"
@@ -62,19 +62,19 @@ for GROUP_IDX in {1..1}; do
 
     # --- Step 7: Compress displacements ---
     python compress_displacements.py \
-        --dataset $DATASET --num_frames $NUM_FRAMES --num_eigenvectors 30 \
-        --displacement_path /home/frozzzen/Documents/Github_SINRG/TSMC/tvm-editing/TVMEditor.Test/bin/Release/net5.0/output/${DATASET}_2000/reference \
-        --output_path /home/frozzzen/Documents/Github_SINRG/TSMC/tvm-editing/TVMEditor.Test/bin/Release/net5.0/output/${DATASET}_2000/reference \
+        --dataset $DATASET --num_frames $NUM_FRAMES --num_eigenvectors 5 \
+        --displacement_path ../tvm-editing/TVMEditor.Test/bin/Release/net5.0/output/${DATASET}_2000/reference \
+        --output_path ../tvm-editing/TVMEditor.Test/bin/Release/net5.0/output/${DATASET}_2000/reference \
         --firstIndex 0 --lastIndex 9 \
-        --reference_mesh_path /home/frozzzen/Documents/Github_SINRG/TSMC/tvm-editing/TVMEditor.Test/bin/Release/net5.0/Data/${DATASET}_2000/reference_mesh/others/decoded_decimated_reference_mesh.obj
+        --reference_mesh_path ../tvm-editing/TVMEditor.Test/bin/Release/net5.0/Data/${DATASET}_2000/reference_mesh/others/decoded_decimated_reference_mesh.obj
 
     # --- Step 8: Evaluation ---
     python evaluation.py \
         --dataset $DATASET --num_frames $NUM_FRAMES --num_centers $NUM_CENTERS \
-        --input_path /home/frozzzen/Documents/Github_SINRG/TSMC/tvm-editing/TVMEditor.Test/bin/Release/net5.0/output/${DATASET}_2000/reference \
-        --dynamic_static_path /home/frozzzen/Documents/VSCodeWorkplace/TSMC_results/$DATASET \
+        --input_path ../tvm-editing/TVMEditor.Test/bin/Release/net5.0/output/${DATASET}_2000/reference \
+        --dynamic_static_path ../data/$DATASET/meshes \
         --firstIndex 0 --lastIndex 9 \
-        --reference_mesh_path /home/frozzzen/Documents/Github_SINRG/TSMC/tvm-editing/TVMEditor.Test/bin/Release/net5.0/Data/${DATASET}_2000/reference_mesh/others/decoded_decimated_reference_mesh.obj \
+        --reference_mesh_path ../tvm-editing/TVMEditor.Test/bin/Release/net5.0/Data/${DATASET}_2000/reference_mesh/others/decoded_decimated_reference_mesh.obj \
         --group_idx $GROUP_IDX
 
     cd ..
