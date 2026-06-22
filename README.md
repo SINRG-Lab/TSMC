@@ -136,6 +136,10 @@ Usually you only need to change index and path. You can also change the followin
 Then you can run volume tracking and get centers like this:
 ```
 cd ./arap-volume-tracking/
+dotnet build -c release
+```
+
+```
 dotnet ./bin/Client.dll ./config/max/<config.xml>
 ```
 e.g.,
@@ -158,7 +162,10 @@ python ./get_transformation.py --dataset answering --num_frames 10 --num_centers
 #### 5. Now we have transformations for centers. We use this to deform each frame in the group to reference centers.
 ```
 cd ../tvm-editing/
+dotnet build TVMEditor.sln --configuration Release --no-incremental
+```
 
+```
 TVMEditor.Test/bin/Release/net5.0/TVMEditor.Test answering 1 0 9 "./TVMEditor.Test/bin/Release/net5.0/Data/answering_2000/" "./TVMEditor.Test/bin/Release/net5.0/output/answering_2000/"
 ```
 There are 3 numbers after `<dataset_name>`, the first one is to set the deformation mode, 1 represents deforming meshes into reference shape, and 2 represents deforming reference mesh into different shapes. The following 2 numbers are --firstIndex 0 --lastIndex 9.
